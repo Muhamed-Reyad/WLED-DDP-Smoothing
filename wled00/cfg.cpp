@@ -620,12 +620,9 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
   CJSON(arlsDisableGammaCorrection, if_live[F("no-gc")]); // false
   CJSON(arlsOffset, if_live[F("offset")]); // 0
   CJSON(ddpSmoothingEnabled, if_live[F("ddp-sm")]);  // DDP frame interpolation
-  CJSON(ddpSmoothingFrames, if_live[F("ddp-smf")]);
-  CJSON(ddpSmoothingDelay, if_live[F("ddp-smd")]);
-  if (ddpSmoothingFrames > DDP_SMOOTHING_MAX_FRAMES) ddpSmoothingFrames = DDP_SMOOTHING_MAX_FRAMES;
-  if (ddpSmoothingFrames == 0) ddpSmoothingFrames = 1;
-  if (ddpSmoothingDelay > DDP_SMOOTHING_MAX_DELAY) ddpSmoothingDelay = DDP_SMOOTHING_MAX_DELAY;
-  if (ddpSmoothingDelay == 0) ddpSmoothingDelay = 1;
+  CJSON(ddpSmoothingSpeed, if_live[F("ddp-sms")]);
+  if (ddpSmoothingSpeed > DDP_SMOOTHING_MAX_SPEED) ddpSmoothingSpeed = DDP_SMOOTHING_MAX_SPEED;
+  if (ddpSmoothingSpeed < 1) ddpSmoothingSpeed = 1;
 
 #ifndef WLED_DISABLE_ALEXA
   CJSON(alexaEnabled, interfaces["va"][F("alexa")]); // false
@@ -1155,8 +1152,7 @@ void serializeConfig(JsonObject root) {
   if_live[F("no-gc")] = arlsDisableGammaCorrection;
   if_live[F("offset")] = arlsOffset;
   if_live[F("ddp-sm")] = ddpSmoothingEnabled;
-  if_live[F("ddp-smf")] = ddpSmoothingFrames;
-  if_live[F("ddp-smd")] = ddpSmoothingDelay;
+  if_live[F("ddp-sms")] = ddpSmoothingSpeed;
 
 #ifndef WLED_DISABLE_ALEXA
   JsonObject if_va = interfaces.createNestedObject("va");

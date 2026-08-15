@@ -474,10 +474,8 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     t = request->arg(F("WO")).toInt();
     if (t >= -255  && t <= 255) arlsOffset = t;
     ddpSmoothingEnabled = request->hasArg(F("SM"));
-    t = request->arg(F("SMF")).toInt();
-    if (t >= 1 && t <= DDP_SMOOTHING_MAX_FRAMES) ddpSmoothingFrames = t;
-    t = request->arg(F("SMD")).toInt();
-    if (t >= 1 && t <= DDP_SMOOTHING_MAX_DELAY) ddpSmoothingDelay = t;
+    t = request->arg(F("SMS")).toInt();
+    if (t >= 1 && t <= DDP_SMOOTHING_MAX_SPEED) ddpSmoothingSpeed = t;
 
 #ifdef WLED_ENABLE_DMX_INPUT
     dmxInputTransmitPin = request->arg(F("IDMT")).toInt();

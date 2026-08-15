@@ -454,13 +454,10 @@ WLED_GLOBAL bool arlsDisableGammaCorrection _INIT(true);          // activate if
 WLED_GLOBAL bool arlsForceMaxBri _INIT(false);                    // enable to force max brightness if source has very dark colors that would be black
 
 // DDP frame interpolation ("smoothing"), implementation in e131.cpp
-#define DDP_SMOOTHING_DEFAULT_FRAMES 6                            // default number of frames interpolated between incoming DDP frames
-#define DDP_SMOOTHING_MAX_FRAMES 30                               // upper bound for the interpolation frame count
-#define DDP_SMOOTHING_DEFAULT_DELAY 6                             // default output lag in source frames (history-ring pipeline depth)
-#define DDP_SMOOTHING_MAX_DELAY 10                                // upper bound for the delayed-frames setting (ring depth is 16)
-WLED_GLOBAL bool ddpSmoothingEnabled _INIT(false);               // enable interpolation between received DDP frames (history-ring pipeline)
-WLED_GLOBAL byte ddpSmoothingFrames _INIT(DDP_SMOOTHING_DEFAULT_FRAMES); // number of frames to interpolate between the currently shown frame and the received one
-WLED_GLOBAL byte ddpSmoothingDelay _INIT(DDP_SMOOTHING_DEFAULT_DELAY);   // output lags the incoming stream by this many source frames
+#define DDP_SMOOTHING_DEFAULT_SPEED 80                            // default blend8Log speed: each tick closes speed/256 of the gap
+#define DDP_SMOOTHING_MAX_SPEED 255                               // upper bound for the smoothing speed
+WLED_GLOBAL bool ddpSmoothingEnabled _INIT(false);               // enable exponential-decay interpolation of received DDP frames
+WLED_GLOBAL byte ddpSmoothingSpeed _INIT(DDP_SMOOTHING_DEFAULT_SPEED);  // per-tick blend factor (1..255), applied at a fixed 20 ms cadence
 
 #ifdef WLED_ENABLE_DMX
  #if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S2)

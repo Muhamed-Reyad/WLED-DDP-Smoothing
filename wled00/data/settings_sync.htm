@@ -192,8 +192,7 @@ Force max brightness: <input type="checkbox" name="FB"><br>
 Disable realtime gamma correction: <input type="checkbox" name="RG"><br>
 Realtime LED offset: <input name="WO" type="number" min="-255" max="255" required><br>
 DDP smoothing: <input type="checkbox" name="SM"><br>
-DDP smoothing frames: <input name="SMF" type="number" min="1" max="30" value="6" required> (frames interpolated between incoming DDP frames)<br>
-DDP smoothing delay: <input name="SMD" type="number" min="1" max="10" value="6" required> (output trails the incoming stream by this many source frames; more = smoother but more latency)<br>
+DDP smoothing speed: <input name="SMS" type="number" min="1" max="255" value="80" required> (fraction of the remaining gap erased per tick; higher = faster response, lower = smoother decay)<br>
 <div id="dmxInput">
 	<br>
 	<h4>Wired DMX Input</h4>
