@@ -17,11 +17,16 @@ motion:
 - A configurable number of interpolated frames (`ddpSmoothingFrames`) is rendered
   between the currently displayed frame and the frame that just arrived.
 - Each interpolated frame is a per-channel integer blend of
-  `current` and `target`:
+  `current` and `target`, with a **logarithmic easing curve** (`ease-out`):
+  motion starts fast and decelerates when approaching the target:
 
   ```
-  channel_out = current + (target - current) * step / 255
+  eased  = log2(1 + p * 127) / 7            (p = 0..1, pre-computed 256-entry LUT)
+  channel_out = current + (target - current) * eased_step / 255
   ```
+
+  The easing LUT is built once on first use (`ddpSmoothBuildEaseLUT()`) so the
+  per-pixel hot path stays pure integer.
 
 ## 2. How the flow works
 
@@ -149,6 +154,8 @@ Interpolating hundreds of pixels extra times at high frame rates costs CPU. To s
 affordable on the 80/160 MHz ESP8266 core:
 
 - Pure integer LERP (32-bit) per channel — no floating point in the render loop.
+  (The logarithmic easing LUT is the only float code, and runs exactly once on
+  first use, then is only a table lookup.)
 - The interp loop runs in the main `loop()`, so it yields to other work.
 - The number of levels rendered is capped by the main-loop rate; on an ESP8266 under
   heavy UDP load the effective output rate automatically and gracefully trails off
@@ -179,6 +186,14 @@ affordable on the 80/160 MHz ESP8266 core:
    as in the stock DDP path (`useMainSegmentOnly ? trigger() : show()`), so the
    existing realtime render path (which skips effect servicing in non-main-segment
    realtime mode) remains intact.
+8. **Physical refresh ceiling.** The requested output rate is
+   `source_fps × (ddpSmoothingFrames + 1)`, but it cannot exceed what the LED bus
+   can physically push (`≈ 1000 / (LEDs × 0.03 ms)` for WS2812 @800 kHz). Over that
+   ceiling, interpolation levels are skipped (see stats below) and raising `SMF`
+   has no visible effect.
+9. **Logarithmic easing.** Interpolation progress `p` is remapped through a
+   256-entry `log2(1 + p·127) / 7` LUT (ease-out). Fast start, gentle landing on
+   the target — perceptually softer than linear steps at the same level count.
 
 ## 7. Build & verification
 
@@ -187,13 +202,15 @@ affordable on the 80/160 MHz ESP8266 core:
 - `npm test` — 16/16 passing (`node --test`).
 - `pio run -e esp32dev` — **SUCCESS**:
   ```
-  RAM:   [==        ]  24.9% (used 81576 bytes from 327680 bytes)
-  Flash: [========  ]  82.6% (used 1299461 bytes from 1572864 bytes)
+  RAM:   [==        ]  25.0% (used 81848 bytes from 327680 bytes)
+  Flash: [========  ]  82.6% (used 1299725 bytes from 1572864 bytes)
   ```
   Output: `build_output\release\WLED_16.0.1_ESP32.bin`
 - `e131.cpp` initially failed to compile because the static smoothing helpers were
   defined below their first use; fixed by adding forward declarations at the top of
   `e131.cpp`.
+- Logarithmic easing (`logf` LUT build, one-time) adds ~52 B of flash; no new
+  runtime float in the per-pixel path.
 
 ### 7.1 Environment workaround (not a repo change)
 
@@ -211,6 +228,26 @@ no-op/idempotent `package-postinstall.py` to
 - Optionally add an `if_live["ddp-sm"]` toggle to the web Live tab (not just the
   settings page).
 - Consider exposing interpolation stats (current step / dropped levels) in
-  `/json/info` for debugging.
+  `/json/info` for debugging. (Today the counters only print under `WLED_DEBUG`;
+  WLED already reports achieved strip FPS in `/json/state` → `leds["fps"]`.)
 - Run a `pio run -e nodemcuv2` pass to gauge ESP8266 flash/RAM impact with the
   feature compiled in.
+
+## 9. Debugging the effective output rate
+
+Enable a debug build (`-D WLED_DEBUG`) and feed your DDP source, then watch the
+serial log. Roughly every **2 s** `ddpSmoothDebugStats()` prints:
+
+```
+DDP smooth: 42 frames rendered, 3 levels skipped (SMF=10, steps=11, dur=50ms)
+```
+
+- `frames rendered` — number of interpolated frames actually pushed to the strip
+  in the last 2 s window.
+- `levels skipped` — quantized interpolation levels that had to be dropped because
+  the main loop or the LED bus could not keep up. **Non-zero ⇒ you are at/over the
+  physical refresh ceiling** (see Finding 8), and raising `SMF` will not help.
+
+A cheaper always-on check that needs no debug build: read
+`http://<ip>/json/state` → `leds["fps"]`, which WLED already computes from the real
+show cadence.

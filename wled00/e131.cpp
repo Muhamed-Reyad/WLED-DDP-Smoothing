@@ -13,6 +13,7 @@ static void sendArtnetPollReply(ArtPollReply *reply, IPAddress ipAddress, uint16
 static bool ddpSmoothEnsureBuffers();
 static void ddpSmoothStore(uint16_t i, uint8_t r, uint8_t g, uint8_t b, uint8_t w);
 static void ddpSmoothFrameDone();
+static void ddpSmoothDebugStats();
 
 
 /*
@@ -146,6 +147,18 @@ static uint32_t  ddpSmoothFrameStart  = 0;     // millis() when interpolation st
 static uint32_t  ddpSmoothDuration    = 0;     // desired ms of the interpolation
 static uint32_t  ddpSmoothLastArrival = 0;     // millis() of the previously completed frame
 
+// Logarithmic easing lookup table: remaps linear progress (0..255) to a
+// logarithmic ease-out curve (fast start, gentle approach to the target).
+// Built once via ddpSmoothBuildEaseLUT() and only used as an index lookup in
+// the hot render path, keeping integer math for the per-pixel LERP.
+static uint8_t   ddpSmoothEaseLUT[256];
+static bool      ddpSmoothEaseReady = false;
+
+// Diagnostic counters (always maintained, only printed under WLED_DEBUG).
+static uint32_t  ddpSmoothRenderedFrames = 0; // interpolated frames actually shown
+static uint32_t  ddpSmoothSkippedLevels  = 0; // quantized levels skipped (loop too slow)
+static uint32_t  ddpSmoothStatsLastMs    = 0; // millis() of the last stats printout
+
 static void ddpSmoothAbort() {
   ddpSmoothActive = false;
   ddpSmoothStepsTotal = 0;
@@ -235,11 +248,32 @@ static void ddpSmoothFrameDone() {
   ddpSmoothLastArrival = now;
 }
 
+// Build the one-time logarithmic easing LUT. Maps a linear progress step
+// (0..255) to an eased step so that interpolation starts quickly and decelerates
+// when approaching the target frame, which reads as a softer motion.
+// The curve used is: eased = log2(1 + p * (2^n - 1)) / n, with n = 7 (k = 128).
+// Log2 of the integer 2^k keeps the build as integer-safe as possible.
+static void ddpSmoothBuildEaseLUT() {
+  constexpr int shift = 7;
+  for (uint16_t s = 0; s <= 255; s++) {
+    float p = float(s) / 255.0f;
+    // log2(1 + p * (2^shift - 1)) / shift  -> 0..1, ease-out curve
+    float eased = logf(1.0f + p * ((1 << shift) - 1)) / (shift * 0.6931471805599453f);
+    if (eased < 0.0f) eased = 0.0f;
+    if (eased > 1.0f) eased = 1.0f;
+    ddpSmoothEaseLUT[s] = (uint8_t)(eased * 255.0f + 0.5f);
+  }
+  ddpSmoothEaseLUT[255] = 255; // the last step must always land exactly on the target
+  ddpSmoothEaseReady = true;
+}
+
 // Render a single interpolated frame into the strip. step ranges 0..255
 // (0 = "current" frame, 255 = "target" frame). Per-channel integer LERP:
 //     out = current + (target - current) * step / 255
 static void ddpSmoothRenderStep(uint8_t step) {
   if (!ddpSmoothCurr || !ddpSmoothTarget) return;
+  if (!ddpSmoothEaseReady) ddpSmoothBuildEaseLUT(); // ensure LUT before first use
+  step = ddpSmoothEaseLUT[step]; // apply logarithmic easing to the progress step
   for (uint16_t i = 0; i < ddpSmoothBufLen; i++) {
     uint16_t p = i * 4;
     uint8_t r = (uint8_t)(ddpSmoothCurr[p]   + ((int32_t)ddpSmoothTarget[p]   - ddpSmoothCurr[p])   * step / 255);
@@ -271,7 +305,9 @@ bool ddpSmoothLoop() {
   if (elapsed >= ddpSmoothDuration || ddpSmoothStepsTotal <= 1) {
     // interpolation finished (or only one frame to show): land exactly on target
     ddpSmoothRenderStep(255);
+    ddpSmoothRenderedFrames++;
     ddpSmoothAbort();
+    ddpSmoothDebugStats();
     return true;
   }
 
@@ -281,10 +317,30 @@ bool ddpSmoothLoop() {
   if (seq < 1) seq = 1;
   if (seq >= ddpSmoothStepsTotal) seq = ddpSmoothStepsTotal - 1;
   if (seq == ddpSmoothLastSeq) return false; // this level was already rendered
+  if (ddpSmoothLastSeq != 0xFFFFFFFF && seq > ddpSmoothLastSeq + 1) ddpSmoothSkippedLevels += seq - ddpSmoothLastSeq - 1; // loop could not keep up
   ddpSmoothLastSeq = seq;
   uint8_t step = (uint8_t)(seq > 0 ? (uint16_t)seq * 255u / ddpSmoothStepsTotal : 0);
   ddpSmoothRenderStep(step);
+  ddpSmoothRenderedFrames++;
+  ddpSmoothDebugStats();
   return true;
+}
+
+// Periodically print interpolation statistics (compiled out unless WLED_DEBUG).
+// Informs how many interpolated frames were actually shown and how many
+// quantized levels had to be skipped because the main loop / LED bus could not
+// keep up with the requested (ddpSmoothingFrames + 1) sub-frames per source frame.
+static void ddpSmoothDebugStats() {
+  uint32_t now = millis();
+  if (now - ddpSmoothStatsLastMs < 2000) return;
+  ddpSmoothStatsLastMs = now;
+  #ifdef WLED_DEBUG
+  DEBUG_PRINTF_P(PSTR("DDP smooth: %lu frames rendered, %lu levels skipped (SMF=%u, steps=%u, dur=%lums)\n"),
+    (unsigned long)ddpSmoothRenderedFrames, (unsigned long)ddpSmoothSkippedLevels,
+    ddpSmoothingFrames, (unsigned)ddpSmoothStepsTotal, (unsigned long)ddpSmoothDuration);
+  ddpSmoothRenderedFrames = 0;
+  ddpSmoothSkippedLevels  = 0;
+  #endif
 }
 
 //E1.31 and Art-Net protocol support
