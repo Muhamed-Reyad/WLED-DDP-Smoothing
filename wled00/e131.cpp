@@ -232,10 +232,12 @@ static void ddpSmoothRenderDecay() {
   if (speed > DDP_SMOOTHING_MAX_SPEED) speed = DDP_SMOOTHING_MAX_SPEED;
   for (uint16_t i = 0; i < ddpSmoothBufLen; i++) {
     uint16_t p = i * 4;
-    uint8_t r = (uint8_t)(ddpSmoothCurr[p]   + (((int32_t)ddpSmoothTarget[p]   - ddpSmoothCurr[p])   * (int32_t)speed) >> 8);
-    uint8_t g = (uint8_t)(ddpSmoothCurr[p+1] + (((int32_t)ddpSmoothTarget[p+1] - ddpSmoothCurr[p+1]) * (int32_t)speed) >> 8);
-    uint8_t b = (uint8_t)(ddpSmoothCurr[p+2] + (((int32_t)ddpSmoothTarget[p+2] - ddpSmoothCurr[p+2]) * (int32_t)speed) >> 8);
-    uint8_t w = (uint8_t)(ddpSmoothCurr[p+3] + (((int32_t)ddpSmoothTarget[p+3] - ddpSmoothCurr[p+3]) * (int32_t)speed) >> 8);
+    // NOTE the shift must only apply to the delta product, not to the whole
+    // sum: (curr + delta*speed) >> 8 would progressively erase `current`.
+    uint8_t r = (uint8_t)(ddpSmoothCurr[p]   + ((((int32_t)ddpSmoothTarget[p]   - ddpSmoothCurr[p])   * (int32_t)speed) >> 8));
+    uint8_t g = (uint8_t)(ddpSmoothCurr[p+1] + ((((int32_t)ddpSmoothTarget[p+1] - ddpSmoothCurr[p+1]) * (int32_t)speed) >> 8));
+    uint8_t b = (uint8_t)(ddpSmoothCurr[p+2] + ((((int32_t)ddpSmoothTarget[p+2] - ddpSmoothCurr[p+2]) * (int32_t)speed) >> 8));
+    uint8_t w = (uint8_t)(ddpSmoothCurr[p+3] + ((((int32_t)ddpSmoothTarget[p+3] - ddpSmoothCurr[p+3]) * (int32_t)speed) >> 8));
     ddpSmoothCurr[p]   = r;
     ddpSmoothCurr[p+1] = g;
     ddpSmoothCurr[p+2] = b;
