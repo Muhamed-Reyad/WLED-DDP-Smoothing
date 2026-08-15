@@ -719,8 +719,10 @@ void serializeInfo(JsonObject root)
   //DDP smoothing diagnostics: rendered = interpolated frames shown since last query,
   //skipped = interpolation levels dropped because the loop/LED bus could not keep up.
   uint32_t ddpSmoothRendered = 0, ddpSmoothSkipped = 0;
-  bool ddpSmoothOn = ddpSmoothGetStats(ddpSmoothRendered, ddpSmoothSkipped);
-  leds[F("ddpSmooth")] = ddpSmoothOn;
+  bool ddpSmoothOn = false, ddpSmoothActive = false;
+  ddpSmoothGetStats(ddpSmoothOn, ddpSmoothActive, ddpSmoothRendered, ddpSmoothSkipped);
+  leds[F("ddpSmooth")] = ddpSmoothOn;     // setting enabled (persisted toggle)
+  leds[F("ddpActive")] = ddpSmoothActive; // actively interpolating right now
   leds[F("ddpRendered")] = ddpSmoothRendered;
   leds[F("ddpSkipped")] = ddpSmoothSkipped;
   //leds[F("actseg")] = strip.getActiveSegmentsNum();

@@ -344,17 +344,19 @@ static void ddpSmoothDebugStats() {
 }
 
 // Report smoothing diagnostic counters (readable from /json/info).
-// Returns true when smoothing is currently enabled/engaged. The output counters
-// count since the previous call, resetting each time so the web UI sees a live 1s
-// rate rather than monotonic totals.
-bool ddpSmoothGetStats(uint32_t& rendered, uint32_t& skipped) {
+// enabled is the persisted toggle setting; active is whether interpolation is
+// engaged at this instant (DDP streaming, realtime mode, no override). The
+// rendered/skipped counters count since the previous call, resetting each time so
+// the web UI sees a live rate rather than monotonic totals.
+void ddpSmoothGetStats(bool& enabled, bool& active, uint32_t& rendered, uint32_t& skipped) {
+  enabled = ddpSmoothingEnabled;
+  active  = ddpSmoothingEnabled && ddpSmoothActive && (realtimeMode == REALTIME_MODE_DDP);
   uint32_t r = ddpSmoothRenderedFrames;
   uint32_t s = ddpSmoothSkippedLevels;
   ddpSmoothRenderedFrames = 0;
   ddpSmoothSkippedLevels  = 0;
   rendered = r;
   skipped  = s;
-  return ddpSmoothingEnabled && ddpSmoothActive;
 }
 
 //E1.31 and Art-Net protocol support
