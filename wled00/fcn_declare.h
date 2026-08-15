@@ -293,6 +293,7 @@ void exitRealtime();
 void handleNotifications();
 void setRealtimePixel(uint16_t i, byte r, byte g, byte b, byte w);
 bool ddpSmoothLoop();  // e131.cpp: render next interpolated DDP frame if one is due
+bool ddpSmoothGetStats(uint32_t& rendered, uint32_t& skipped);  // e131.cpp: live smoothing diagnostics
 void refreshNodeList();
 void sendSysInfoUDP();
 #ifndef WLED_DISABLE_ESPNOW

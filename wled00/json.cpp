@@ -716,6 +716,13 @@ void serializeInfo(JsonObject root)
   leds["fps"] = strip.getFps();
   leds[F("maxpwr")] = BusManager::currentMilliamps()>0 ? BusManager::ablMilliampsMax() : 0;
   leds[F("maxseg")] = WS2812FX::getMaxSegments();
+  //DDP smoothing diagnostics: rendered = interpolated frames shown since last query,
+  //skipped = interpolation levels dropped because the loop/LED bus could not keep up.
+  uint32_t ddpSmoothRendered = 0, ddpSmoothSkipped = 0;
+  bool ddpSmoothOn = ddpSmoothGetStats(ddpSmoothRendered, ddpSmoothSkipped);
+  leds[F("ddpSmooth")] = ddpSmoothOn;
+  leds[F("ddpRendered")] = ddpSmoothRendered;
+  leds[F("ddpSkipped")] = ddpSmoothSkipped;
   //leds[F("actseg")] = strip.getActiveSegmentsNum();
   //leds[F("seglock")] = false; //might be used in the future to prevent modifications to segment config
   leds[F("bootps")] = bootPreset;

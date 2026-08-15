@@ -251,3 +251,16 @@ DDP smooth: 42 frames rendered, 3 levels skipped (SMF=10, steps=11, dur=50ms)
 A cheaper always-on check that needs no debug build: read
 `http://<ip>/json/state` → `leds["fps"]`, which WLED already computes from the real
 show cadence.
+
+Since v2, `/json/info` → `leds` also exposes live smoothing diagnostics (no debug
+build needed):
+
+```
+"DDP smoothing" ... /json/info → leds:
+  ddpSmooth:   true/false   ← interpolation engine engaged right now
+  ddpRendered: N            ← interpolated frames actually shown since last poll (≈ rate/s)
+  ddpSkipped:  M            ← interpolation levels dropped (loop/bus too slow)
+```
+
+If `ddpSkipped > 0` persists while `ddpSmooth == true`, the strip is at its physical
+refresh ceiling (Finding 8) — raising `ddpSmoothingFrames` won't smooth further.
