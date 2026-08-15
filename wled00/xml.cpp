@@ -526,6 +526,7 @@ void getSettingsJS(byte subPage, Print& settingsScript)
     printSetFormValue(settingsScript,PSTR("WO"),arlsOffset);
     printSetFormCheckbox(settingsScript,PSTR("SM"),ddpSmoothingEnabled);
     printSetFormValue(settingsScript,PSTR("SMF"),ddpSmoothingFrames);
+    printSetFormValue(settingsScript,PSTR("SMD"),ddpSmoothingDelay);
     #ifndef WLED_DISABLE_ALEXA
     printSetFormCheckbox(settingsScript,PSTR("AL"),alexaEnabled);
     printSetFormValue(settingsScript,PSTR("AI"),alexaInvocationName);

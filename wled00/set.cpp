@@ -476,6 +476,8 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     ddpSmoothingEnabled = request->hasArg(F("SM"));
     t = request->arg(F("SMF")).toInt();
     if (t >= 1 && t <= DDP_SMOOTHING_MAX_FRAMES) ddpSmoothingFrames = t;
+    t = request->arg(F("SMD")).toInt();
+    if (t >= 1 && t <= DDP_SMOOTHING_MAX_DELAY) ddpSmoothingDelay = t;
 
 #ifdef WLED_ENABLE_DMX_INPUT
     dmxInputTransmitPin = request->arg(F("IDMT")).toInt();

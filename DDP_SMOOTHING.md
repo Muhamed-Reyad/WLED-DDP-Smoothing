@@ -13,9 +13,13 @@ When receiving realtime DDP frames, the source frame rate may be visibly choppy
 motion:
 
 - Incoming DDP frames are intercepted **before** they are written to the strip.
-- The pipeline is delayed by roughly **one source frame**.
+- Completed source frames are stored in a **history ring** of `DDP_SMOOTH_RING_DEPTH`
+  (16) RGBW planes; rendering locks a *pair* of adjacent frames and blends only
+  between those two for the whole duration.
+- The output trails the stream by `ddpSmoothingDelay` source frames (1–10), so newly
+  arriving frames can never replace the blend target mid-flight ("no rabid jumps").
 - A configurable number of interpolated frames (`ddpSmoothingFrames`) is rendered
-  between the currently displayed frame and the frame that just arrived.
+  between the locked `current` and `target` frames.
 - Each interpolated frame is a per-channel integer blend of
   `current` and `target`, with a **logarithmic easing curve** (`ease-out`):
   motion starts fast and decelerates when approaching the target:
@@ -26,7 +30,8 @@ motion:
   ```
 
   The easing LUT is built once on first use (`ddpSmoothBuildEaseLUT()`) so the
-  per-pixel hot path stays pure integer.
+  per-pixel hot path stays pure integer. The ring planes are treated as immutable,
+  so the same committed frame can be re-blended safely at any step.
 
 ## 2. How the flow works
 
@@ -45,13 +50,15 @@ With smoothing enabled, `handleDDPPacket()` does **not** touch the strip. Instea
 
 ```
 handleDDPPacket()
-    ├─ ddpSmoothStore(i, r, g, b, w)   → writes into target buffer
-    └─ (on PUSH) ddpSmoothFrameDone()   → arms the interpolator
+    ├─ ddpSmoothStore(i, r, g, b, w)   → writes into the ring plane of the frame
+    │                                    currently being received (head)
+    └─ (on PUSH) ddpSmoothFrameDone()   → commits the frame, advances the head
 
 main loop → ddpSmoothLoop() (called from handleNotifications())
-    └─ renders interpolated frames into the strip at the observed source rate,
-       writing through setRealtimePixel() so all existing address/mapping logic
-       (arlsOffset, main-segment-only, led maps) is preserved unchanged.
+    └─ locks a pair (frames N-1 .. N) from the ring, trails the head by
+       ddpSmoothingDelay frames, and renders interpolated frames into the strip at
+       the observed source rate, writing through setRealtimePixel() so all existing
+       address/mapping logic (arlsOffset, main-segment-only, led maps) is preserved.
 ```
 
 Rendering uses the exact same per-LED addressing as the original direct path
@@ -68,11 +75,11 @@ The original plan stepped an index counter per display tick. That is fragile: th
 main loop's iteration rate varies wildly while it parses UDP traffic, so a
 counter-based approach either misses steps or overshoots the target frame.
 
-**Finding:** time-based progress is far more robust. When a PUSH frame arrives, the
-observed inter-arrival interval of the source is used as the interpolation duration:
+**Finding:** time-based progress is far more robust. The observed inter-arrival
+interval of the source is used as the interpolation duration:
 
 ```
-duration = now - lastFrameArrival          (clamped to [1, 5000] ms)
+duration = observed source interval            (clamped to [1, 5000] ms)
 steps    = ddpSmoothingFrames + 1
 ```
 
@@ -93,33 +100,42 @@ Only a *changed* level causes a render, so:
 - The number of physically rendered frames is capped at the main-loop rate; faster
   loops show more of the interpolated levels.
 
-The "one frame delay" is inherent: interpolation starts from what is currently on
-screen and takes about one source-frame interval to reach the freshly received frame.
+**Pipelined delay:** instead of blending the on-screen frame toward *whatever just
+arrived* (which made the old one-frame version fight itself: every new PUSH re-targeted
+the blend), the ring-queue model *locks a pair* of committed frames. The main loop
+holds the current frame plane for the entire duration of one blend, then advances one
+frame toward the newest committed frame. The pipeline trails the write head by
+`ddpSmoothingDelay` finished frames, absorbing loop jitter and guaranteeing that a
+freshly received frame (which can be wildly different, e.g. a scene cut) only affects
+the display after the current blend has landed.
 
 ## 4. Source changes
 
 | File | Change |
 |------|--------|
-| `wled00/e131.cpp` | Interpolation engine: `ddpSmoothEnsureBuffers()`, `ddpSmoothStore()`, `ddpSmoothFrameDone()`, `ddpSmoothRenderStep()`, `ddpSmoothLoop()`; integration into `handleDDPPacket()` |
+| `wled00/e131.cpp` | Interpolation engine: `ddpSmoothEnsureBuffers()`, `ddpSmoothStore()`, `ddpSmoothFrameDone()`, `ddpSmoothRenderStep()`, `ddpSmoothLoop()`; 16-plane history ring, locked-pair blending; integration into `handleDDPPacket()` |
 | `wled00/udp.cpp` | Call `ddpSmoothLoop()` from `handleNotifications()` (after the realtime-timeout check) |
-| `wled00/wled.h` | New globals `ddpSmoothingEnabled`, `ddpSmoothingFrames`; macros `DDP_SMOOTHING_DEFAULT_FRAMES` (6), `DDP_SMOOTHING_MAX_FRAMES` (30) |
+| `wled00/wled.h` | New globals `ddpSmoothingEnabled`, `ddpSmoothingFrames`, `ddpSmoothingDelay`; macros `DDP_SMOOTHING_DEFAULT_FRAMES` (6), `DDP_SMOOTHING_MAX_FRAMES` (30), `DDP_SMOOTHING_DEFAULT_DELAY` (6), `DDP_SMOOTHING_MAX_DELAY` (10) |
 | `wled00/fcn_declare.h` | Declares `bool ddpSmoothLoop()` |
-| `wled00/cfg.cpp` | Persists `if_live["ddp-sm"]` (bool) and `if_live["ddp-smf"]` (1–30) |
-| `wled00/set.cpp` | Parses `SM` / `SMF` form fields |
-| `wled00/xml.cpp` | Emits the settings-JS values for `SM` / `SMF` |
-| `wled00/data/settings_sync.htm` | New "DDP smoothing" checkbox + "DDP smoothing frames" number input |
+| `wled00/cfg.cpp` | Persists `if_live["ddp-sm"]` (bool), `if_live["ddp-smf"]` (1–30), `if_live["ddp-smd"]` (1–10) |
+| `wled00/set.cpp` | Parses `SM` / `SMF` / `SMD` form fields |
+| `wled00/xml.cpp` | Emits the settings-JS values for `SM` / `SMF` / `SMD` |
+| `wled00/data/settings_sync.htm` | New "DDP smoothing" checkbox + "DDP smoothing frames" + "DDP smoothing delay" number inputs |
 
 ### 4.1 Configuration
 
 - **Settings UI** (Settings → Sync → Realtime):
   - `DDP smoothing` checkbox
   - `DDP smoothing frames` (1–30, default 6) — frames interpolated between incoming
-    DDP frames; output delayed by ~1 frame.
+    DDP frames.
+  - `DDP smoothing delay` (1–10, default 6) — output lags the incoming stream by this
+    many source frames; higher = gentler motion, more latency.
 - **JSON config** (`/json/cfg`, `interfaces.live`):
   - `ddp-sm` : bool
   - `ddp-smf` : int (1–30)
+  - `ddp-smd` : int (1–10)
 - The form keys `SM`/`SMF` were chosen because `DS` is already used by
-  `serverDescription` ("Device Name").
+  `serverDescription` ("Device Name"). `SMD` (smoothing delay) is free.
 
 ### 4.2 Behavioural notes
 
@@ -136,17 +152,27 @@ The original proposal suggested static double RGB buffers. Based on the project'
 own guidance (keep allocation static to avoid fragmentation on ESP8266, but ESP8266
 only has ~30–40 KB free), we chose **lazy, demand allocation** instead:
 
-- Two RGBW planes (`current` + `target`) sized to `strip.getLengthTotal()` are
-  allocated via `d_malloc()` on the **first received DDP packet after the feature is
-  enabled**.
-- Footprint while active ≈ **8 bytes per LED** (e.g. 300 LEDs ≈ 2.4 KB).
+- A single contiguous history ring sized to `strip.getLengthTotal()` is allocated
+  via `d_malloc()` on the **first received DDP packet after the feature is enabled**.
+- Footprint while active ≈ **4 × DDP_SMOOTH_RING_DEPTH bytes per LED** (16 planes,
+  e.g. 222 LEDs ≈ 14.2 KB). The ring is one allocation (a single pointer) so it is
+  cheaper to manage than 16 separate planes.
 - If allocation fails, the feature silently degrades to the stock direct-render path
   (no crash, no further retry until the strip length changes).
-- Buffers are **kept allocated** while the session runs (reset each boot). This
+- The ring is **kept allocated** while the session runs (reset each boot). This
   avoids free/realloc churn during enable/disable toggles — which would otherwise
   fragment the heap — and a resize mid-interpolation would race between the async
   UDP task and the main loop. A resize is therefore only permitted while no
   interpolation is active.
+
+### Ring depth vs delay (dimensioning)
+
+`DDP_SMOOTH_RING_DEPTH = 16` is a power of two so slot wrap-around (`seq & MASK`)
+stays a cheap bitwise AND. The locked pair trails the write head by `delay + 2`
+slots at most (worst case `delay = 10`), leaving at least
+`16 − (10 + 2) = 4` spare slots before the async writer could wrap into a plane the
+main loop is currently blending; a store-side guard (see §6.10) covers pathological
+stalls beyond that. This is why the delay knob is capped at 10.
 
 ### CPU trade-off (ESP8266)
 
@@ -175,13 +201,15 @@ affordable on the 80/160 MHz ESP8266 core:
 3. **Sequence tracking must be preserved.** With smoothing active the push event is
    consumed by `ddpSmoothFrameDone()`, but `e131LastSequenceNumber[]` is still
    updated so the existing out-of-sequence rejection keeps working.
-4. **First frame has no "previous" frame.** It is displayed immediately (single
-   "frame" at step 255); interpolation starts from the second frame onward.
+4. **First frame has no "previous" frame.** With the ring model the very first frame
+   is painted directly (step 255 at the trailing edge) and only then does the locked-
+   pair pipeline start advancing one frame per source interval.
 5. **Source pause:** the interpolation duration is clamped to 5 s, and the normal
    realtime timeout still applies, so a dead source results in the expected exit back
-   to normal effects.
+   to normal effects. While fewer than `delay+1` frames have accumulated, the main
+   loop holds the trailing edge and simply waits.
 6. **Settings key collision:** `DS` was rejected (used by Device Name) in favor of
-   `SM`/`SMF`.
+   `SM`/`SMF`; `SMD` (smoothing delay) is free.
 7. **Wayback: the strip show cadence.** `strip.show()`/`trigger()` is reused exactly
    as in the stock DDP path (`useMainSegmentOnly ? trigger() : show()`), so the
    existing realtime render path (which skips effect servicing in non-main-segment
@@ -194,6 +222,11 @@ affordable on the 80/160 MHz ESP8266 core:
 9. **Logarithmic easing.** Interpolation progress `p` is remapped through a
    256-entry `log2(1 + p·127) / 7` LUT (ease-out). Fast start, gentle landing on
    the target — perceptually softer than linear steps at the same level count.
+10. **Store-side ring guard.** `ddpSmoothStore()` refuses to write into a ring slot
+    that belongs to the currently blended pair, but only once the ring has wrapped at
+    least once (`ddpSmoothSeq >= DDP_SMOOTH_RING_DEPTH`). During normal operation the
+    4-slot margin means the guard never triggers; it exists purely as a correctness
+    net for pathological main-loop stalls.
 
 ## 7. Build & verification
 
@@ -202,8 +235,8 @@ affordable on the 80/160 MHz ESP8266 core:
 - `npm test` — 16/16 passing (`node --test`).
 - `pio run -e esp32dev` — **SUCCESS**:
   ```
-  RAM:   [==        ]  25.0% (used 81848 bytes from 327680 bytes)
-  Flash: [========  ]  82.6% (used 1299725 bytes from 1572864 bytes)
+  RAM:   [==        ]  25.0% (used 81856 bytes from 327680 bytes)
+  Flash: [========  ]  82.7% (used 1300309 bytes from 1572864 bytes)
   ```
   Output: `build_output\release\WLED_16.0.1_ESP32.bin`
 - `e131.cpp` initially failed to compile because the static smoothing helpers were
@@ -224,12 +257,12 @@ no-op/idempotent `package-postinstall.py` to
 
 ## 8. Suggested follow-ups
 
-- Test on a live DDP source (e.g. LedFx) and tune the default `ddpSmoothingFrames`.
+- Test on a live DDP source (e.g. LedFx): A/B the pipe delay (`SMD` 1 vs 6 vs 10) and
+  tune the default `ddpSmoothingFrames`.
 - Optionally add an `if_live["ddp-sm"]` toggle to the web Live tab (not just the
   settings page).
-- Consider exposing interpolation stats (current step / dropped levels) in
-  `/json/info` for debugging. (Today the counters only print under `WLED_DEBUG`;
-  WLED already reports achieved strip FPS in `/json/state` → `leds["fps"]`.)
+- Consider exposing the current delay value in `/json/info` alongside the existing
+  diagnostics below.
 - Run a `pio run -e nodemcuv2` pass to gauge ESP8266 flash/RAM impact with the
   feature compiled in.
 
@@ -239,7 +272,7 @@ Enable a debug build (`-D WLED_DEBUG`) and feed your DDP source, then watch the
 serial log. Roughly every **2 s** `ddpSmoothDebugStats()` prints:
 
 ```
-DDP smooth: 42 frames rendered, 3 levels skipped (SMF=10, steps=11, dur=50ms)
+DDP smooth: 42 frames rendered, 3 levels skipped (SMF=10, SMD=6, steps=11, dur=50ms)
 ```
 
 - `frames rendered` — number of interpolated frames actually pushed to the strip
@@ -247,6 +280,7 @@ DDP smooth: 42 frames rendered, 3 levels skipped (SMF=10, steps=11, dur=50ms)
 - `levels skipped` — quantized interpolation levels that had to be dropped because
   the main loop or the LED bus could not keep up. **Non-zero ⇒ you are at/over the
   physical refresh ceiling** (see Finding 8), and raising `SMF` will not help.
+- `SMD` — the configured smoothing delay (output lag in source frames).
 
 A cheaper always-on check that needs no debug build: read
 `http://<ip>/json/state` → `leds["fps"]`, which WLED already computes from the real

@@ -456,8 +456,11 @@ WLED_GLOBAL bool arlsForceMaxBri _INIT(false);                    // enable to f
 // DDP frame interpolation ("smoothing"), implementation in e131.cpp
 #define DDP_SMOOTHING_DEFAULT_FRAMES 6                            // default number of frames interpolated between incoming DDP frames
 #define DDP_SMOOTHING_MAX_FRAMES 30                               // upper bound for the interpolation frame count
-WLED_GLOBAL bool ddpSmoothingEnabled _INIT(false);               // enable interpolation between received DDP frames (delays output by ~1 frame)
+#define DDP_SMOOTHING_DEFAULT_DELAY 6                             // default output lag in source frames (history-ring pipeline depth)
+#define DDP_SMOOTHING_MAX_DELAY 10                                // upper bound for the delayed-frames setting (ring depth is 16)
+WLED_GLOBAL bool ddpSmoothingEnabled _INIT(false);               // enable interpolation between received DDP frames (history-ring pipeline)
 WLED_GLOBAL byte ddpSmoothingFrames _INIT(DDP_SMOOTHING_DEFAULT_FRAMES); // number of frames to interpolate between the currently shown frame and the received one
+WLED_GLOBAL byte ddpSmoothingDelay _INIT(DDP_SMOOTHING_DEFAULT_DELAY);   // output lags the incoming stream by this many source frames
 
 #ifdef WLED_ENABLE_DMX
  #if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S2)

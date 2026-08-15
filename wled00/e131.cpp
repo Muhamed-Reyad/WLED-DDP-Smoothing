@@ -114,12 +114,19 @@ static void handleDDPPacket(e131_packet_t* p, size_t packetLen) {
  * DDP frame interpolation ("smoothing").
  * ======================================
  * When ddpSmoothingEnabled is true, incoming DDP pixel data is not written to
- * the strip immediately. Instead it is stored in a target buffer. When the
- * packet carrying the DDP PUSH flag (end of frame) arrives, display is handed
- * over to ddpSmoothLoop() which continuously blends the currently shown frame
- * ("current") toward the freshly received frame ("target"). This delays the
- * output by roughly one source frame while multiplying the output frame rate by
- * up to (ddpSmoothingFrames + 1).
+ * the strip immediately. Every completed source frame (detected by the DDP PUSH
+ * flag) is stored in a history ring of DDP_SMOOTH_RING_DEPTH RGBW planes.
+ * ddpSmoothLoop() - driven from the main loop - then locks a *pair* of adjacent
+ * frames from that history ("current" and "target") and blends that pair over
+ * one source frame interval, multiplying the output frame rate by up to
+ * (ddpSmoothingFrames + 1).
+ *
+ * The pair is locked for the whole duration of the blend: a freshly received
+ * frame is only appended to the ring and can never replace the blend target
+ * mid-flight, so colors do not "jump rabidly" even when the source produces
+ * very different frames back to back. The output trails the stream by
+ * ddpSmoothingDelay source frames (1..10); that buffer of finished frames is
+ * what makes the pacing steady and absorb loop jitter.
  *
  * Interpolation progress is driven by wall clock time (based on the observed
  * source frame interval) rather than by loop iterations, so it stays smooth
@@ -129,23 +136,41 @@ static void handleDDPPacket(e131_packet_t* p, size_t packetLen) {
  *     out = current + (target - current) * step / 255
  * to keep the 80/160 MHz ESP8266 core from being swamped by floating point.
  *
- * Buffers are allocated lazily (only while the feature is enabled) as two RGBW
- * planes of the strip length (~8 bytes per LED while active). Allocation
- * failure degrades gracefully to the default direct-render behaviour.
+ * Memory: the ring is allocated lazily (only while the feature is enabled) and
+ * holds DDP_SMOOTH_RING_DEPTH RGBW planes of the strip length. Depth is a power
+ * of two (16) so the slot wrap-around (`seq & MASK`) stays a cheap bitwise AND in
+ * the hot path. The locked pair trails the write head by delay+2 slots at most,
+ * leaving at least 16-(10+2)=4 slots of spare margin before the async writer
+ * could wrap into a plane the main loop is blending (worst case, delay=10); the
+ * store guard below covers pathological stalls beyond that. With the default
+ * depth that is ~64 bytes per LED while active. Allocation failure degrades
+ * gracefully to the default direct-render behaviour.
+ *
+ * Threading: handleDDPPacket() runs on the UDP async task, ddpSmoothLoop() on
+ * the main loop. All shared state is plain 32-bit counters - ddpSmoothSeq is
+ * only written by the async task and only read by the main loop, ddpSmoothLockedSeq
+ * the other way around - so each side sees either an old or a new value but
+ * never a torn one. Ring slot conflicts (should the write head ever catch up to
+ * the currently blended pair) are fended off in ddpSmoothStore().
  */
-static uint8_t  *ddpSmoothCurr    = nullptr; // currently displayed frame (RGBW)
-static uint8_t  *ddpSmoothTarget  = nullptr; // freshly received frame (RGBW)
-static uint16_t  ddpSmoothBufLen  = 0;       // number of LEDs the buffers can hold
-static uint16_t  ddpSmoothReqLen  = 0;       // strip length the buffers were sized for
-static bool      ddpSmoothAllocFailed = false; // no more retries until length changes
+#define DDP_SMOOTH_RING_DEPTH 16
+#define DDP_SMOOTH_RING_MASK  (DDP_SMOOTH_RING_DEPTH - 1)
 
-static bool      ddpSmoothHaveDisplay = false; // curr already holds a complete frame
-static bool      ddpSmoothActive      = false; // interpolation in progress
-static uint16_t  ddpSmoothStepsTotal  = 0;     // frames to render between two pushes
-static uint32_t  ddpSmoothLastSeq     = 0;     // last quantized progress level rendered
-static uint32_t  ddpSmoothFrameStart  = 0;     // millis() when interpolation started
-static uint32_t  ddpSmoothDuration    = 0;     // desired ms of the interpolation
-static uint32_t  ddpSmoothLastArrival = 0;     // millis() of the previously completed frame
+static uint8_t  *ddpSmoothRing     = nullptr;   // contiguous memory holding the whole frame ring (RGBW)
+static uint16_t  ddpSmoothBufLen   = 0;         // number of LEDs one ring plane can hold
+static uint16_t  ddpSmoothReqLen   = 0;         // strip length the ring was sized for
+static bool      ddpSmoothAllocFailed = false;  // no more retries until length changes
+
+static uint32_t  ddpSmoothSeq        = 0;       // frames completed so far (written by async task)
+static uint32_t  ddpSmoothLockedSeq  = 0;       // seq of the blend target (written by main loop)
+static bool      ddpSmoothActive     = false;   // a blend is in progress
+static bool      ddpSmoothHaveShown  = false;   // at least one frame has been put on the strip
+static uint16_t  ddpSmoothStepsTotal = 0;       // frames to render per source frame
+static uint32_t  ddpSmoothLastSeq    = 0;       // last quantized progress level rendered
+static uint32_t  ddpSmoothFrameStart = 0;       // millis() when the current blend started
+static uint32_t  ddpSmoothDuration   = 0;       // desired ms of the current blend
+static uint32_t  ddpSmoothSourceInterval = 0;   // observed ms between two source frames (async task)
+static uint32_t  ddpSmoothLastArrival = 0;      // millis() of the previously completed frame
 
 // Logarithmic easing lookup table: remaps linear progress (0..255) to a
 // logarithmic ease-out curve (fast start, gentle approach to the target).
@@ -159,6 +184,7 @@ static uint32_t  ddpSmoothRenderedFrames = 0; // interpolated frames actually sh
 static uint32_t  ddpSmoothSkippedLevels  = 0; // quantized levels skipped (loop too slow)
 static uint32_t  ddpSmoothStatsLastMs    = 0; // millis() of the last stats printout
 
+// Cancel any in-flight blend. The ring contents and write/read heads are kept.
 static void ddpSmoothAbort() {
   ddpSmoothActive = false;
   ddpSmoothStepsTotal = 0;
@@ -166,40 +192,31 @@ static void ddpSmoothAbort() {
 
 static void ddpSmoothReset() {
   ddpSmoothAbort();
-  ddpSmoothHaveDisplay = false;
-  ddpSmoothLastArrival = 0;
+  ddpSmoothHaveShown = false;
+  ddpSmoothLockedSeq = 0;
 }
 
-// (Re)allocate the interpolation buffers to match the current strip length.
-// Returns true if the buffers are usable, false (degrading to direct render) otherwise.
+// (Re)allocate the frame history ring to match the current strip length.
+// Returns true if the ring is usable, false (degrading to direct render) otherwise.
 static bool ddpSmoothEnsureBuffers() {
   uint16_t total = strip.getLengthTotal();
   if (total == 0) return false;
-  if (ddpSmoothBufLen >= total && ddpSmoothCurr && ddpSmoothTarget) {
+  if (ddpSmoothRing && ddpSmoothBufLen >= total) {
     ddpSmoothReqLen = total;
     return true;
   }
-  if (ddpSmoothActive) return false; // never resize buffers mid-interpolation (async callback vs. main loop race)
+  if (ddpSmoothActive) return false; // never resize the ring mid-interpolation (async callback vs. main loop race)
   if (ddpSmoothAllocFailed && ddpSmoothReqLen >= total) return false; // do not hammer the heap
-  size_t alloc = (size_t)total * 4; // RGBW bytes per LED
-  uint8_t *newCurr   = (uint8_t*) d_malloc(alloc);
-  uint8_t *newTarget = newCurr ? (uint8_t*) d_malloc(alloc) : nullptr;
-  if (!newTarget) {
-    d_free(newCurr);
+  size_t alloc = (size_t)total * 4 * DDP_SMOOTH_RING_DEPTH; // RGBW bytes per LED, one plane per ring slot
+  uint8_t *newRing = (uint8_t*) d_malloc(alloc);
+  if (!newRing) {
     ddpSmoothReqLen = total;
     ddpSmoothAllocFailed = true;
     return false;
   }
-  memset(newCurr, 0, alloc);
-  memset(newTarget, 0, alloc);
-  if (ddpSmoothCurr && ddpSmoothReqLen) {
-    // carry over any already displayed frame (e.g. after a strip length change)
-    memcpy(newCurr, ddpSmoothCurr, ((ddpSmoothReqLen < total) ? ddpSmoothReqLen : total) * 4);
-  }
-  d_free(ddpSmoothCurr);
-  d_free(ddpSmoothTarget);
-  ddpSmoothCurr   = newCurr;
-  ddpSmoothTarget = newTarget;
+  memset(newRing, 0, alloc);
+  d_free(ddpSmoothRing);
+  ddpSmoothRing = newRing;
   ddpSmoothBufLen = total;
   ddpSmoothReqLen = total;
   ddpSmoothAllocFailed = false;
@@ -207,45 +224,47 @@ static bool ddpSmoothEnsureBuffers() {
   return true;
 }
 
+// Base pointer of a ring plane for the given frame sequence number.
+static inline uint8_t* ddpSmoothPlane(uint32_t seq) {
+  return ddpSmoothRing + ((size_t)(seq & DDP_SMOOTH_RING_MASK) * ddpSmoothBufLen * 4);
+}
+
 // Realtime listener: called from handleDDPPacket() for every received pixel while
-// smoothing is enabled. Stores the data in the target buffer using the same LED
-// addressing that setRealtimePixel() would use, so rendering can reproduce it.
+// smoothing is enabled. Stores the data in the plane belonging to the frame that
+// is currently being received (ddpSmoothSeq), using the same LED addressing that
+// setRealtimePixel() would use, so rendering can reproduce it.
 static void ddpSmoothStore(uint16_t i, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-  if (!ddpSmoothTarget || i >= ddpSmoothBufLen) return;
+  if (!ddpSmoothRing || i >= ddpSmoothBufLen) return;
+  // protect the plane(s) the main loop is currently blending: never write into a
+  // slot that belongs to the locked pair, otherwise the blend could tear.
+  if (ddpSmoothActive) {
+    uint32_t locked = ddpSmoothLockedSeq & DDP_SMOOTH_RING_MASK;
+    uint32_t write = ddpSmoothSeq & DDP_SMOOTH_RING_MASK;
+    if ((write == locked || write == ((locked + DDP_SMOOTH_RING_DEPTH - 1) & DDP_SMOOTH_RING_MASK)) && ddpSmoothSeq >= DDP_SMOOTH_RING_DEPTH) return;
+  }
   int pix = (int)i + arlsOffset; // same mapping as setRealtimePixel()
   if (pix < 0 || pix >= (int)ddpSmoothBufLen) return; // outside the visible strip
   uint16_t p = i * 4;
-  ddpSmoothTarget[p+0] = r;
-  ddpSmoothTarget[p+1] = g;
-  ddpSmoothTarget[p+2] = b;
-  ddpSmoothTarget[p+3] = w;
+  uint8_t *plane = ddpSmoothPlane(ddpSmoothSeq);
+  plane[p+0] = r;
+  plane[p+1] = g;
+  plane[p+2] = b;
+  plane[p+3] = w;
 }
 
 // Realtime listener: called from handleDDPPacket() when a push frame arrives.
-// Arms the interpolation so ddpSmoothLoop() can blend the current display toward
-// the just received frame over the observed source frame interval.
+// Commits the frame that was just completed (the one stored under ddpSmoothSeq) by
+// advancing the write head. Main loop: ddpSmoothLoop() may now blend older frames.
 static void ddpSmoothFrameDone() {
   uint32_t now = millis();
-  if (!ddpSmoothHaveDisplay) {
-    // no previous frame to blend from: show the received frame right away
-    ddpSmoothFrameStart = now;
-    ddpSmoothDuration = 0;
-    ddpSmoothStepsTotal = 1;
-    ddpSmoothLastSeq = 0xFFFFFFFF; // force a render on the first loop call
-    ddpSmoothActive = true;
-    ddpSmoothHaveDisplay = true;
-  } else {
-    // one frame delay: spread the interpolation evenly over the source frame interval
-    uint32_t interval = (ddpSmoothLastArrival) ? now - ddpSmoothLastArrival : 250;
+  if (ddpSmoothLastArrival) {
+    uint32_t interval = now - ddpSmoothLastArrival;
     if (interval < 1) interval = 1;
     if (interval > 5000) interval = 5000; // source went quiet, do not over-delay
-    ddpSmoothFrameStart = now;
-    ddpSmoothDuration = interval;
-    ddpSmoothStepsTotal = (uint16_t)(ddpSmoothingFrames + 1);
-    ddpSmoothLastSeq = 0xFFFFFFFF; // force a render on the first loop call
-    ddpSmoothActive = true;
+    ddpSmoothSourceInterval = interval;
   }
   ddpSmoothLastArrival = now;
+  ddpSmoothSeq++;
 }
 
 // Build the one-time logarithmic easing LUT. Maps a linear progress step
@@ -268,61 +287,97 @@ static void ddpSmoothBuildEaseLUT() {
 }
 
 // Render a single interpolated frame into the strip. step ranges 0..255
-// (0 = "current" frame, 255 = "target" frame). Per-channel integer LERP:
+// (0 = "current" frame, 255 = "target" frame). Reads the two locked ring planes
+// every time (the ring is immutable history, never written back to, so a frame
+// that has been committed can always be re-blended safely). Per-channel integer LERP:
 //     out = current + (target - current) * step / 255
 static void ddpSmoothRenderStep(uint8_t step) {
-  if (!ddpSmoothCurr || !ddpSmoothTarget) return;
+  if (!ddpSmoothRing || ddpSmoothLockedSeq > ddpSmoothSeq) return;
   if (!ddpSmoothEaseReady) ddpSmoothBuildEaseLUT(); // ensure LUT before first use
   step = ddpSmoothEaseLUT[step]; // apply logarithmic easing to the progress step
+  uint32_t currSeq = (ddpSmoothLockedSeq > 0) ? ddpSmoothLockedSeq - 1 : 0; // first frame: blend frame 0 onto itself
+  const uint8_t *curr   = ddpSmoothPlane(currSeq);
+  const uint8_t *target = ddpSmoothPlane(ddpSmoothLockedSeq);
   for (uint16_t i = 0; i < ddpSmoothBufLen; i++) {
     uint16_t p = i * 4;
-    uint8_t r = (uint8_t)(ddpSmoothCurr[p]   + ((int32_t)ddpSmoothTarget[p]   - ddpSmoothCurr[p])   * step / 255);
-    uint8_t g = (uint8_t)(ddpSmoothCurr[p+1] + ((int32_t)ddpSmoothTarget[p+1] - ddpSmoothCurr[p+1]) * step / 255);
-    uint8_t b = (uint8_t)(ddpSmoothCurr[p+2] + ((int32_t)ddpSmoothTarget[p+2] - ddpSmoothCurr[p+2]) * step / 255);
-    uint8_t w = (uint8_t)(ddpSmoothCurr[p+3] + ((int32_t)ddpSmoothTarget[p+3] - ddpSmoothCurr[p+3]) * step / 255);
-    ddpSmoothCurr[p]   = r; // write back so the next step continues from what we rendered
-    ddpSmoothCurr[p+1] = g;
-    ddpSmoothCurr[p+2] = b;
-    ddpSmoothCurr[p+3] = w;
+    uint8_t r = (uint8_t)(curr[p]   + ((int32_t)target[p]   - curr[p])   * step / 255);
+    uint8_t g = (uint8_t)(curr[p+1] + ((int32_t)target[p+1] - curr[p+1]) * step / 255);
+    uint8_t b = (uint8_t)(curr[p+2] + ((int32_t)target[p+2] - curr[p+2]) * step / 255);
+    uint8_t w = (uint8_t)(curr[p+3] + ((int32_t)target[p+3] - curr[p+3]) * step / 255);
     setRealtimePixel(i, r, g, b, w);
   }
   if (useMainSegmentOnly) strip.trigger();
   else                    strip.show();
 }
 
-// Main-loop driver (called from handleNotifications()). Renders the interpolated
-// frames in lockstep with the observed source frame rate.
+// Main-loop driver (called from handleNotifications()). Blends the locked pair
+// (frames ddpSmoothLockedSeq-1 .. ddpSmoothLockedSeq) over one source interval,
+// then advances one frame toward the newest committed frame, keeping the output
+// exactly ddpSmoothingDelay frames behind the stream. While the buffer is not yet
+// full it holds the frame at the trailing edge, so newly arriving frames are
+// accumulated but never tear a frame that is currently on screen.
 bool ddpSmoothLoop() {
   if (!ddpSmoothingEnabled || realtimeMode != REALTIME_MODE_DDP || realtimeOverride) {
     ddpSmoothReset();
     return false;
   }
-  if (!ddpSmoothActive || !ddpSmoothCurr || !ddpSmoothTarget) return false;
+  if (!ddpSmoothRing) return false;
 
   uint32_t now = millis();
-  uint32_t elapsed = now - ddpSmoothFrameStart;
 
-  if (elapsed >= ddpSmoothDuration || ddpSmoothStepsTotal <= 1) {
-    // interpolation finished (or only one frame to show): land exactly on target
+  // finish the in-flight blend, exactly landing on the target frame
+  if (ddpSmoothActive) {
+    uint32_t elapsed = now - ddpSmoothFrameStart;
+    if (elapsed >= ddpSmoothDuration || ddpSmoothStepsTotal <= 1) {
+      ddpSmoothRenderStep(255);
+      ddpSmoothRenderedFrames++;
+      ddpSmoothActive = false;
+      ddpSmoothDebugStats();
+    } else {
+      // quantize progress to ddpSmoothStepsTotal levels so exactly that many distinct
+      // frames are shown per source frame (progress 0 = current, N = target)
+      uint32_t seq = (uint64_t)elapsed * ddpSmoothStepsTotal / ddpSmoothDuration;
+      if (seq < 1) seq = 1;
+      if (seq >= ddpSmoothStepsTotal) seq = ddpSmoothStepsTotal - 1;
+      if (seq == ddpSmoothLastSeq) return false; // this level was already rendered
+      if (ddpSmoothLastSeq != 0xFFFFFFFF && seq > ddpSmoothLastSeq + 1) ddpSmoothSkippedLevels += seq - ddpSmoothLastSeq - 1; // loop could not keep up
+      ddpSmoothLastSeq = seq;
+      uint8_t step = (uint8_t)((uint16_t)seq * 255u / ddpSmoothStepsTotal);
+      ddpSmoothRenderStep(step);
+      ddpSmoothRenderedFrames++;
+      ddpSmoothDebugStats();
+      return true;
+    }
+  }
+
+  // arm the next blend towards the newest committed frame minus the requested delay
+  uint32_t highest = ddpSmoothSeq - 1; // newest fully received frame
+  uint32_t delay = ddpSmoothingDelay;
+  if (delay < 1)  delay = 1;
+  if (delay > DDP_SMOOTHING_MAX_DELAY) delay = DDP_SMOOTHING_MAX_DELAY;
+
+  if (!ddpSmoothHaveShown) {
+    // first visibility: paint the trailing frame directly so the screen is not black
+    if (ddpSmoothSeq == 0) return false;
+    uint32_t target = (highest > delay) ? highest - delay : 0;
+    ddpSmoothLockedSeq = target;
+    ddpSmoothHaveShown = true;
     ddpSmoothRenderStep(255);
     ddpSmoothRenderedFrames++;
-    ddpSmoothAbort();
-    ddpSmoothDebugStats();
     return true;
   }
 
-  // quantize progress to ddpSmoothStepsTotal levels so exactly that many distinct
-  // frames are shown per source frame (progress 0 = current, N = target)
-  uint32_t seq = (uint64_t)elapsed * ddpSmoothStepsTotal / ddpSmoothDuration;
-  if (seq < 1) seq = 1;
-  if (seq >= ddpSmoothStepsTotal) seq = ddpSmoothStepsTotal - 1;
-  if (seq == ddpSmoothLastSeq) return false; // this level was already rendered
-  if (ddpSmoothLastSeq != 0xFFFFFFFF && seq > ddpSmoothLastSeq + 1) ddpSmoothSkippedLevels += seq - ddpSmoothLastSeq - 1; // loop could not keep up
-  ddpSmoothLastSeq = seq;
-  uint8_t step = (uint8_t)(seq > 0 ? (uint16_t)seq * 255u / ddpSmoothStepsTotal : 0);
-  ddpSmoothRenderStep(step);
-  ddpSmoothRenderedFrames++;
-  ddpSmoothDebugStats();
+  if (highest <= delay) return false; // buffer not full yet, hold the trailing frame
+  uint32_t target = highest - delay;
+  if (target == ddpSmoothLockedSeq) return false; // no newer frame to blend toward yet, hold
+  ddpSmoothLockedSeq = target;
+  ddpSmoothFrameStart = now;
+  ddpSmoothDuration = ddpSmoothSourceInterval ? ddpSmoothSourceInterval : 250;
+  ddpSmoothStepsTotal = ddpSmoothingFrames + 1;
+  if (ddpSmoothStepsTotal < 1) ddpSmoothStepsTotal = 1;
+  ddpSmoothLastSeq = 0xFFFFFFFF; // force a render on the next loop call
+  ddpSmoothActive = true;
+  ddpSmoothHaveShown = true;
   return true;
 }
 
@@ -335,9 +390,9 @@ static void ddpSmoothDebugStats() {
   if (now - ddpSmoothStatsLastMs < 2000) return;
   ddpSmoothStatsLastMs = now;
   #ifdef WLED_DEBUG
-  DEBUG_PRINTF_P(PSTR("DDP smooth: %lu frames rendered, %lu levels skipped (SMF=%u, steps=%u, dur=%lums)\n"),
+  DEBUG_PRINTF_P(PSTR("DDP smooth: %lu frames rendered, %lu levels skipped (SMF=%u, SMD=%u, steps=%u, dur=%lums)\n"),
     (unsigned long)ddpSmoothRenderedFrames, (unsigned long)ddpSmoothSkippedLevels,
-    ddpSmoothingFrames, (unsigned)ddpSmoothStepsTotal, (unsigned long)ddpSmoothDuration);
+    ddpSmoothingFrames, ddpSmoothingDelay, (unsigned)ddpSmoothStepsTotal, (unsigned long)ddpSmoothDuration);
   ddpSmoothRenderedFrames = 0;
   ddpSmoothSkippedLevels  = 0;
   #endif
