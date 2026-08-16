@@ -17,6 +17,8 @@ jobs:
     name: Deploy nightly
     runs-on: ubuntu-latest
     needs: wled_build
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
